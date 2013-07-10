@@ -3,6 +3,7 @@ package org.n3r.flume.source.exec;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
@@ -16,13 +17,13 @@ import java.util.regex.Pattern;
 
 import org.apache.commons.lang.StringUtils;
 import org.apache.flume.Context;
-import org.apache.flume.CounterGroup;
 import org.apache.flume.Event;
 import org.apache.flume.EventDrivenSource;
 import org.apache.flume.SystemClock;
 import org.apache.flume.channel.ChannelProcessor;
 import org.apache.flume.conf.Configurable;
 import org.apache.flume.event.EventBuilder;
+import org.apache.flume.instrumentation.SourceCounter;
 import org.apache.flume.source.AbstractSource;
 import org.apache.flume.source.ExecSourceConfigurationConstants;
 import org.slf4j.Logger;
@@ -35,72 +36,75 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
 
     private static final Logger logger = LoggerFactory.getLogger(ExecBlockSource.class);
 
+    private String shell;
     private String command;
-    private CounterGroup counterGroup;
+    private SourceCounter sourceCounter;
     private ExecutorService executor;
     private Future<?> runnerFuture;
     private long restartThrottle;
     private boolean restart;
     private boolean logStderr;
     private Integer bufferCount;
-    private Integer bufferTimeout;
+    private long bufferTimeout;
     private Pattern boundaryRegex;
     private ExecRunnable runner;
+    private Charset charset;
 
     @Override
     public void start() {
-        logger.info("ExecEnhanced source starting with command:{}", command);
+        logger.info("Execblock source starting with command:{}", command);
 
         executor = Executors.newSingleThreadExecutor();
-        counterGroup = new CounterGroup();
 
-        runner = new ExecRunnable(command, getChannelProcessor(), counterGroup,
-                restart, restartThrottle, logStderr, bufferCount, bufferTimeout, boundaryRegex);
+        runner = new ExecRunnable(shell, command, getChannelProcessor(), sourceCounter,
+                restart, restartThrottle, logStderr, bufferCount, bufferTimeout, boundaryRegex, charset);
 
-        // FIXME: Use a callback-like executor / future to signal us upon failure.
+        // FIXME: Use a callback-like executor / future to signal us upon
+        // failure.
         runnerFuture = executor.submit(runner);
 
         /*
-         * NB: This comes at the end rather than the beginning of the method because
-         * it sets our state to running. We want to make sure the executor is alive
-         * and well first.
+         * NB: This comes at the end rather than the beginning of the method
+         * because it sets our state to running. We want to make sure the
+         * executor is alive and well first.
          */
+        sourceCounter.start();
         super.start();
 
-        logger.debug("ExecEnhanced source started");
+        logger.debug("Execblock source started");
     }
 
     @Override
     public void stop() {
-        logger.info("Stopping execEnhanced source with command:{}", command);
-
+        logger.info("Stopping execblock source with command:{}", command);
         if (runner != null) {
             runner.setRestart(false);
             runner.kill();
         }
-        if (runnerFuture != null) {
-            logger.debug("Stopping execEnhanced runner");
-            runnerFuture.cancel(true);
-            logger.debug("ExecEnhanced runner stopped");
-        }
 
+        if (runnerFuture != null) {
+            logger.debug("Stopping execblock runner");
+            runnerFuture.cancel(true);
+            logger.debug("Execblock runner stopped");
+        }
         executor.shutdown();
 
         while (!executor.isTerminated()) {
-            logger.debug("Waiting for execEnhanced executor service to stop");
+            logger.debug("Waiting for execblock executor service to stop");
             try {
                 executor.awaitTermination(500, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
-                logger.debug("Interrupted while waiting for execEnhanced executor service "
+                logger.debug("Interrupted while waiting for execblock executor service "
                         + "to stop. Just exiting.");
                 Thread.currentThread().interrupt();
             }
         }
 
+        sourceCounter.stop();
         super.stop();
 
-        logger.debug("ExecEnhanced source with command:{} stopped. Metrics:{}", command,
-                counterGroup);
+        logger.debug("Execblock source with command:{} stopped. Metrics:{}", command,
+                sourceCounter);
     }
 
     @Override
@@ -121,43 +125,54 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
         bufferCount = context.getInteger(ExecSourceConfigurationConstants.CONFIG_BATCH_SIZE,
                 ExecSourceConfigurationConstants.DEFAULT_BATCH_SIZE);
 
-        bufferTimeout = context.getInteger("batchTimeout", 3000);
+        bufferTimeout = context.getLong(ExecSourceConfigurationConstants.CONFIG_BATCH_TIME_OUT,
+                ExecSourceConfigurationConstants.DEFAULT_BATCH_TIME_OUT);
 
         String regex = context.getString("boundaryRegex");
         boundaryRegex = StringUtils.isEmpty(regex) ? null : Pattern.compile(regex);
 
+        charset = Charset.forName(context.getString(ExecSourceConfigurationConstants.CHARSET,
+                ExecSourceConfigurationConstants.DEFAULT_CHARSET));
+
+        shell = context.getString(ExecSourceConfigurationConstants.CONFIG_SHELL, null);
+
+        if (sourceCounter == null)
+            sourceCounter = new SourceCounter(getName());
+
         logger.info("Configuration : restartThrottle=" + restartThrottle + ", restart=" + restart +
                 ", logStderr=" + logStderr + ", bufferCount=" + bufferCount + ", bufferTimeout=" +
-                bufferTimeout + ", boundaryRegex=" + regex);
+                bufferTimeout + ", boundaryRegex=" + regex + ", charset" + charset + ", shell" + shell);
     }
 
     private static class ExecRunnable implements Runnable {
 
-        private static final String EXEC_ENHANCED_LINES_READ = "exec.enhanced.lines.read";
-
-        public ExecRunnable(String command, ChannelProcessor channelProcessor,
-                CounterGroup counterGroup, boolean restart, long restartThrottle,
-                boolean logStderr, int bufferCount, int bufferTimeout, Pattern boundaryRegex) {
+        public ExecRunnable(String shell, String command, ChannelProcessor channelProcessor,
+                SourceCounter sourceCounter, boolean restart, long restartThrottle,
+                boolean logStderr, int bufferCount, long bufferTimeout, Pattern boundaryRegex, Charset charset) {
             this.command = command;
             this.channelProcessor = channelProcessor;
-            this.counterGroup = counterGroup;
+            this.sourceCounter = sourceCounter;
             this.restartThrottle = restartThrottle;
             this.bufferCount = bufferCount;
             this.bufferTimeout = bufferTimeout;
             this.restart = restart;
             this.logStderr = logStderr;
             this.boundaryRegex = boundaryRegex;
+            this.charset = charset;
+            this.shell = shell;
         }
 
-        private String command;
-        private ChannelProcessor channelProcessor;
-        private CounterGroup counterGroup;
+        private final String shell;
+        private final String command;
+        private final ChannelProcessor channelProcessor;
+        private final SourceCounter sourceCounter;
         private volatile boolean restart;
-        private long restartThrottle;
-        private int bufferCount;
-        private int bufferTimeout;
-        private boolean logStderr;
+        private final long restartThrottle;
+        private final int bufferCount;
+        private long bufferTimeout;
+        private final boolean logStderr;
         private Pattern boundaryRegex;
+        private final Charset charset;
         private Process process = null;
         private SystemClock systemClock = new SystemClock();
         private Long lastPushToChannel = systemClock.currentTimeMillis();
@@ -171,33 +186,40 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
             do {
                 String exitCode = "unknown";
                 BufferedReader reader = null;
+
                 try {
-                    String[] commandArgs = command.split("\\s+");
-                    process = new ProcessBuilder(commandArgs).start();
+                    if (shell != null) {
+                        String[] commandArgs = formulateShellCommand(shell, command);
+                        process = Runtime.getRuntime().exec(commandArgs);
+                    } else {
+                        String[] commandArgs = command.split("\\s+");
+                        process = new ProcessBuilder(commandArgs).start();
+                    }
                     reader = new BufferedReader(
-                            new InputStreamReader(process.getInputStream()));
+                            new InputStreamReader(process.getInputStream(), charset));
 
                     // StderrLogger dies as soon as the input stream is invalid
                     StderrReader stderrReader = new StderrReader(new BufferedReader(
-                            new InputStreamReader(process.getErrorStream())), logStderr);
+                            new InputStreamReader(process.getErrorStream(), charset)), logStderr);
                     stderrReader.setName("StderrReader-[" + command + "]");
                     stderrReader.setDaemon(true);
                     stderrReader.start();
 
-                    String line = null;
-
+                    // Start flush thread
                     startTimedFlushService();
 
+                    String line = null;
                     while ((line = reader.readLine()) != null) {
                         synchronized (eventList) {
                             processLine(line);
-                            if (eventList.size() >= bufferCount)
+                            if (eventList.size() >= bufferCount || timeout())
                                 flushEventBatch(eventList);
                         }
                     }
+
                     synchronized (eventList) {
                         if (!eventList.isEmpty())
-                            channelProcessor.processEventBatch(eventList);
+                            flushEventBatch(eventList);
                     }
                 } catch (Exception e) {
                     logger.error("Failed while running command: " + command, e);
@@ -208,7 +230,7 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
                         try {
                             reader.close();
                         } catch (IOException ex) {
-                            logger.error("Failed to close reader for execEnhanced source", ex);
+                            logger.error("Failed to close reader for execblock source", ex);
                         }
                     }
                     exitCode = String.valueOf(kill());
@@ -230,39 +252,36 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
         private void startTimedFlushService() {
             timedFlushService = Executors.newSingleThreadScheduledExecutor(
                     new ThreadFactoryBuilder().setNameFormat(
-                            "timedFlushExecService" + Thread.currentThread().getId()).build());
+                            "timedFlushExecService" + Thread.currentThread().getId() + "-%d").build());
 
             future = timedFlushService.scheduleWithFixedDelay(new Runnable() {
-                    @Override
-                    public void run() {
-                        try {
-                            synchronized (eventList) {
-                                if (!timeout())
-                                    return;
+                @Override
+                public void run() {
+                    try {
+                        synchronized (eventList) {
+                            if (StringUtils.isNotEmpty(block.toString()))
+                                flushBlock();
 
-                                if (StringUtils.isNotEmpty(block.toString()))
-                                    flushBlock();
-
-                                if(!eventList.isEmpty()) {
-                                    logger.info("Timeout : eventList size is [{}]", eventList.size());
-                                    flushEventBatch(eventList);
-                                }
+                            if (!eventList.isEmpty() && timeout()) {
+                                logger.info("Timeout : eventList size is [{}]", eventList.size());
+                                flushEventBatch(eventList);
                             }
-                        } catch (Exception e) {
-                            logger.error("Exception occured when flushing event batch", e);
-                            if(e instanceof InterruptedException)
-                                Thread.currentThread().interrupt();
                         }
+                    } catch (Exception e) {
+                        logger.error("Exception occured when flushing event batch", e);
+                        if (e instanceof InterruptedException)
+                            Thread.currentThread().interrupt();
                     }
-                }, bufferTimeout, bufferTimeout, TimeUnit.MILLISECONDS);
+                }
+            }, bufferTimeout, bufferTimeout, TimeUnit.MILLISECONDS);
         }
 
         private void processLine(String line) {
             // Line break
             if (null == boundaryRegex) {
-                logger.info("Line : {}", line);
-                counterGroup.incrementAndGet(EXEC_ENHANCED_LINES_READ);
-                eventList.add(EventBuilder.withBody(line.getBytes()));
+                logger.info("Line : [{}]", line);
+                sourceCounter.incrementEventReceivedCount();
+                eventList.add(EventBuilder.withBody(line.getBytes(charset)));
                 return;
             }
 
@@ -271,11 +290,11 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
             int start = 0;
             while (matcher.find()) {
                 // Incr counter
-                counterGroup.incrementAndGet(EXEC_ENHANCED_LINES_READ);
+                sourceCounter.incrementEventReceivedCount();
                 // Append the tail to last block before flushing it
                 if (matcher.start() > 0) {
                     String tail = line.substring(start, matcher.start());
-                    synchronized(block) {
+                    synchronized (block) {
                         block.append(tail);
                     }
                     // Reset the index of new block
@@ -285,27 +304,36 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
                 if (StringUtils.isNotEmpty(block.toString()))
                     flushBlock();
             }
-            synchronized(block) {
-                block.append(line.substring(start, line.length())).append("\n");
+            synchronized (block) {
+                block.append(line.substring(start, line.length()));
             }
         }
 
         private void flushBlock() {
-            synchronized(block) {
-                logger.info("Flush block [{}]", block.toString());
-                eventList.add(EventBuilder.withBody(block.toString().getBytes()));
+            synchronized (block) {
+                logger.info("Block : [{}]", block.toString());
+                eventList.add(EventBuilder.withBody(block.toString().getBytes(charset)));
                 block.delete(0, block.length());
             }
         }
 
         private void flushEventBatch(List<Event> eventList) {
             channelProcessor.processEventBatch(eventList);
-            lastPushToChannel = systemClock.currentTimeMillis();
+            sourceCounter.addToEventAcceptedCount(eventList.size());
             eventList.clear();
+            lastPushToChannel = systemClock.currentTimeMillis();
         }
 
         private boolean timeout() {
             return (systemClock.currentTimeMillis() - lastPushToChannel) >= bufferTimeout;
+        }
+
+        private static String[] formulateShellCommand(String shell, String command) {
+            String[] shellArgs = shell.split("\\s+");
+            String[] result = new String[shellArgs.length + 1];
+            System.arraycopy(shellArgs, 0, result, 0, shellArgs.length);
+            result[shellArgs.length] = command;
+            return result;
         }
 
         public int kill() {
@@ -327,8 +355,8 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
                             try {
                                 timedFlushService.awaitTermination(500, TimeUnit.MILLISECONDS);
                             } catch (InterruptedException e) {
-                                logger.debug("Interrupted while waiting for execEnhanced timed flush service "
-                                  + "to stop. Just exiting.");
+                                logger.debug("Interrupted while waiting for execblock executor service "
+                                        + "to stop. Just exiting.");
                                 Thread.currentThread().interrupt();
                             }
                         }
@@ -339,7 +367,6 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
                 }
             }
             return Integer.MIN_VALUE;
-
         }
 
         public void setRestart(boolean restart) {
@@ -363,6 +390,9 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
                 String line = null;
                 while ((line = input.readLine()) != null) {
                     if (logStderr)
+                        // There is no need to read 'line' with a charset
+                        // as we do not to propagate it.
+                        // It is in UTF-16 and would be printed in UTF-8 format.
                         logger.info("StderrLogger[{}] = '{}'", ++i, line);
                 }
             } catch (IOException e) {
@@ -372,10 +402,9 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
                     if (input != null)
                         input.close();
                 } catch (IOException ex) {
-                    logger.error("Failed to close stderr reader for execEnhanced source", ex);
+                    logger.error("Failed to close stderr reader for execblock source", ex);
                 }
             }
         }
     }
-
 }
