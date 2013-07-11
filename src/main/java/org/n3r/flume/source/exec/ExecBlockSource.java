@@ -180,6 +180,7 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
         private ScheduledFuture<?> future;
         private List<Event> eventList = new ArrayList<Event>();
         private StringBuilder block = new StringBuilder();
+        private static final String lineFeed = System.getProperty("line.separator");
 
         @Override
         public void run() {
@@ -293,6 +294,8 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
                 sourceCounter.incrementEventReceivedCount();
                 // Append the tail to last block before flushing it
                 if (matcher.start() > 0) {
+                    if (start == 0 && StringUtils.isNotEmpty(block.toString()))
+                        block.append(lineFeed);
                     String tail = line.substring(start, matcher.start());
                     synchronized (block) {
                         block.append(tail);
@@ -305,6 +308,7 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
                     flushBlock();
             }
             synchronized (block) {
+                if (StringUtils.isNotEmpty(block.toString())) block.append(lineFeed);
                 block.append(line.substring(start, line.length()));
             }
         }
