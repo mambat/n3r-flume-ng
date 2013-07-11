@@ -49,6 +49,7 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
     private Pattern boundaryRegex;
     private ExecRunnable runner;
     private Charset charset;
+    private static String newline = System.getProperty("line.separator");
 
     @Override
     public void start() {
@@ -180,7 +181,6 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
         private ScheduledFuture<?> future;
         private List<Event> eventList = new ArrayList<Event>();
         private StringBuilder block = new StringBuilder();
-        private static final String lineFeed = System.getProperty("line.separator");
 
         @Override
         public void run() {
@@ -294,10 +294,9 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
                 sourceCounter.incrementEventReceivedCount();
                 // Append the tail to last block before flushing it
                 if (matcher.start() > 0) {
-                    if (start == 0 && StringUtils.isNotEmpty(block.toString()))
-                        block.append(lineFeed);
                     String tail = line.substring(start, matcher.start());
                     synchronized (block) {
+                        if (start == 0 && block.length() > 0) block.append(newline);
                         block.append(tail);
                     }
                     // Reset the index of new block
@@ -308,7 +307,7 @@ public class ExecBlockSource extends AbstractSource implements EventDrivenSource
                     flushBlock();
             }
             synchronized (block) {
-                if (StringUtils.isNotEmpty(block.toString())) block.append(lineFeed);
+                if (block.length() > 0) block.append(newline);
                 block.append(line.substring(start, line.length()));
             }
         }
